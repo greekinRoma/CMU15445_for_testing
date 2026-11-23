@@ -70,9 +70,12 @@ DiskManager::DiskManager(const std::filesystem::path &db_file) : db_file_name_(d
 void DiskManager::ShutDown() {
   {
     std::scoped_lock scoped_db_io_latch(db_io_latch_);
+    // 对 db_io_latch_ 加锁。这个 mutex 的注释是 “With multiple buffer pool instances, need to protect file access”，ReadPage/WritePage 里也会用它保护对 db_io_ 的读写。这里加锁是为了避免在另一个线程正在读写文件时把流关掉。
     db_io_.close();
+    // 关闭数据库文件流。std::fstream::close 会先把缓冲区里的数据 flush 到文件，再关闭；所以已写入但还在用户态缓冲区的数据不会丢。
   }
   log_io_.close();
+  // 关闭日志文件流。std::fstream::close 会先把缓冲区里的数据 flush 到文件，再关闭；所以已写入但还在用户态缓冲区的数据不会丢。
 }
 
 /**
