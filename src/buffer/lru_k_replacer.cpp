@@ -40,52 +40,59 @@ LRUKReplacer::LRUKReplacer(size_t num_frames, size_t k) : replacer_size_(num_fra
  *
  * @return the frame ID if a frame is successfully evicted, or `std::nullopt` if no frames can be evicted.
  */
-auto LRUKReplacer::Evict() -> std::optional<frame_id_t> 
-{
+auto LRUKReplacer::Evict() -> std::optional<frame_id_t> {
     std::scoped_lock lock(latch_);
-
-    std::optional<frame_id_t> best_inf;
-    // best_inf表示可以未null
+    std::optional<frame_id_t>  best_inf;
     std::optional<frame_id_t> best_finite;
-
     size_t best_inf_ts = 0;
-    size_t  best_finite_ts = 0;
-    for(auto &[fid,node]:node_store_)
-    {
-        if(!node.is_evictable_)
-        { 
-            continue;
-        }
-        const auto & history = node.history_;
-        if (history.size() < k_)
-        {
-            // best_inf 是可选择的，其中没有初始化返回是false
-            //  history.front() < best_inf_ts 表示最早优先
-            if (!best_inf.has_value() || history.front() < best_inf_ts)
-            {
-                best_inf = fid;
-                best_inf_ts = history.front();
-            }
-        }
-        else
-        {
-            if (!best_finite.has_value()||history.front() < best_finite_ts)
-            {
-                best_finite = fid;
-                best_finite_ts = history.front(); 
-            }
-        }
-    }
-    
-    auto victim = best_inf.has_value() ? best_inf:best_finite;
-    //有best_inf先选
-    if (!victim.has_value())
+    size_t best_finite_ts = 0;
+    if (curr_size_<1)
     {
         return std::nullopt;
     }
-    node_store_.erase(*victim); // * 这个从std::optional<frame_id_t>取出idx
+    for (auto it:node_store_)
+    {
+        if (it.second.Is_Evictable()) 
+        {
+            if (it.second.Get_Size()<k_)
+            {
+                if (!best_inf.has_value()){best_inf = it.first;best_inf_ts = it.second.history_.front();}
+                else if (best_inf_ts>it.second.history_.front())
+                {
+                    /* code */
+                    best_inf_ts = it.second.history_.front();
+                    best_inf = it.first;
+                }
+                
+            }
+            else
+            {
+                if (!best_finite.has_value())
+                {
+                    best_finite = it.first;
+                    best_finite_ts = it.second.history_.front();
+                }
+                else if (best_finite_ts>it.second.history_.front())
+                {
+                    best_finite_ts = it.second.history_.front();
+                    best_finite = it.first;
+                }
+
+            }
+        }
+    }
+    frame_id_t victim = best_inf.has_value() ? *best_inf : *best_finite;
+    node_store_.erase(victim);
     curr_size_--;
     return victim;
+
+  // best_inf表示可以未null
+  // best_inf 是可选择的，其中没有初始化返回是false
+  //  history.front() < best_inf_ts 表示最早优先
+  //有best_inf先选
+  // * 这个从std::optional<frame_id_t>取出idx
+//   UNIMPLEMENTED("TODO(P1): Add implementation.");
+
 }
 // 挑一个受害者换出去。在所有可驱逐的frame中找打backward k-distance最大的；不足k次历史的按最首次访问比较。只负责把该frame是BuffPoolManager的事.
 /**
@@ -101,31 +108,21 @@ auto LRUKReplacer::Evict() -> std::optional<frame_id_t>
  * @param access_type type of access that was received. This parameter is only needed for
  * leaderboard tests.
  */
-void LRUKReplacer::RecordAccess(frame_id_t frame_id, AccessType access_type) 
-{
-    std::scoped_lock lock(latch_);
-    if (frame_id >= static_cast<frame_id_t>(replacer_size_)||frame_id<0)
-    {
-        throw Exception("Invalid frame id");
-    }
-
-    current_timestamp_++;
-
-    auto it = node_store_.find(frame_id);
-    if (it==node_store_.end())
-    {
-        it = node_store_.emplace(frame_id, LRUKNode()).first;
-        it->second.fid_ = frame_id;
-        it->second.k_ = k_;
-        // emplace构造一起放进去
-    }
-    
-    it->second.history_.push_back(current_timestamp_);
-    if (it->second.history_.size()>k_)
-    {
-        it->second.history_.pop_front();
-    }
-    
+void LRUKReplacer::RecordAccess(frame_id_t frame_id, AccessType access_type) {
+  // emplace构造一起放进去
+   std::scoped_lock lock(latch_);
+   if (frame_id>=static_cast<frame_id_t>(replacer_size_)||frame_id<0)
+   {
+    throw Exception("frame_id Error!");
+   }
+   auto it = node_store_.find(frame_id);
+   if (it == node_store_.end()) 
+   {
+    it = node_store_.try_emplace(frame_id, k_, frame_id).first;
+    // cur_state 是总共可以编译的页面的数目，但是新生成的页面都是不可编辑的
+   }
+   current_timestamp_  = current_timestamp_ +1;
+   it->second.Push_History(current_timestamp_);
 }
 //记录一次访问。缓冲池每次读写页面都要调它:时间戳 +1,把当前时间戳追加到该 frame 的访问历史尾部,超过 k 个就丢掉最老的那个(只保留最近 k 次)。第一次见到的 frame 会自动创建历史。access_type 只用于 leaderboard 测试,基础实现可忽略。
 /**
@@ -145,24 +142,21 @@ void LRUKReplacer::RecordAccess(frame_id_t frame_id, AccessType access_type)
  * @param frame_id id of frame whose 'evictable' status will be modified
  * @param set_evictable whether the given frame is evictable or not
  */
-void LRUKReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable) 
-{
+void LRUKReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable) {
     std::scoped_lock lock(latch_);
-    // replacer_size 缓冲池总帧数
-    // curr_size_ 是可以被驱逐的数据
-    if (frame_id >= static_cast<frame_id_t>(replacer_size_)||frame_id<0)
+    if (frame_id >=static_cast<frame_id_t>(replacer_size_)||frame_id<0)
     {
-        throw Exception("Invalid frame id");
+        throw Exception("Error in frame_id");
     }
     auto it = node_store_.find(frame_id);
-    if (it == node_store_.end())
-    {
-        return;
-    }
-    if (it->second.is_evictable_==set_evictable) return;
+    if (it== node_store_.end()||it->second.Is_Evictable() == set_evictable) return;
+    it->second.Set_Evictable(set_evictable);
+    set_evictable? curr_size_++:curr_size_--;
 
-    it->second.is_evictable_ = set_evictable;
-    curr_size_ += set_evictable? 1:-1;
+  // replacer_size 缓冲池总帧数
+  // curr_size_ 是可以被驱逐的数据
+//   UNIMPLEMENTED("TODO(P1): Add implementation.");
+
 }
 // 设置该 frame 是否允许被驱逐。被 pin 住的页面(pin_count>0)必须标记为不可驱逐,这样 Evict 永远不会选到它。它同时维护 curr_size_(可驱逐数量):true→+1,false→−1。
 /**
@@ -183,23 +177,17 @@ void LRUKReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable)
  * @param frame_id id of frame to be removed
  */
 void LRUKReplacer::Remove(frame_id_t frame_id) 
-{
-    std::scoped_lock lock(latch_);
-    if (frame_id >= static_cast<frame_id_t>(replacer_size_)||frame_id<0)
-    {
-        throw Exception("Invalid frame id");
-    }
-    auto it = node_store_.find(frame_id);
-    if (it == node_store_.end())
-    {
-        return;
-    }
-    if (!it->second.is_evictable_)
-    {
-        throw Exception("Remove called on a non-evictable frame");
-    }
-    node_store_.erase(it);
-    curr_size_ -- ;
+{ 
+   std::scoped_lock lock(latch_);
+   if (frame_id>=static_cast<frame_id_t>(replacer_size_)||frame_id<0)
+   {
+    throw Exception("frame_id Error!");
+   }
+   auto it = node_store_.find(frame_id);
+   if (it == node_store_.end()) return;
+   if (!it->second.Is_Evictable()) throw Exception("Remove called on a non-evictable frame");
+   curr_size_--;
+   node_store_.erase(it);
 }
 // 定点删除。和 Evict 的"按策略挑人"不同,它删指定的 frame(比如 BPM 里 DeletePage 要把某页直接从内存移除)。frame 不可驱逐时调用要抛异常;不存在则静默返回。
 /**
@@ -209,10 +197,9 @@ void LRUKReplacer::Remove(frame_id_t frame_id)
  *
  * @return size_t
  */
-auto LRUKReplacer::Size() -> size_t 
-{ 
-   std::scoped_lock lock(latch_);
-   return curr_size_;
+auto LRUKReplacer::Size() -> size_t { 
+    std::scoped_lock lock(latch_);
+    return curr_size_;
 }
 // 	返回 curr_size_——注意是可驱逐帧的数量,不是被跟踪的节点总数(这正是被 pin 的页面不算数的原因)。
 }  // namespace bustub
