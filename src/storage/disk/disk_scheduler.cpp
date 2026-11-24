@@ -43,7 +43,7 @@ DiskScheduler::~DiskScheduler() {
  */
 void DiskScheduler::Schedule(std::vector<DiskRequest> &requests) 
 {
-  for(auto& request:requests)
+  for (auto & request:requests)
   {
     request_queue_.Put(std::move(request));
   }
@@ -59,14 +59,11 @@ void DiskScheduler::Schedule(std::vector<DiskRequest> &requests)
  */
 void DiskScheduler::StartWorkerThread() 
 {
-  while(true)
+  while (true)
   {
+    /* code */
     auto request = request_queue_.Get();
-    if (!request.has_value())
-    {
-      return;
-    }
-
+    if (!request.has_value()) return;
     if (request->is_write_)
     {
       disk_manager_->WritePage(request->page_id_,request->data_);
@@ -77,6 +74,7 @@ void DiskScheduler::StartWorkerThread()
     }
     request->callback_.set_value(true);
   }
+  
 }
 
 }  // namespace bustub
