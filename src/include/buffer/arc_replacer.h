@@ -120,14 +120,14 @@ class ArcReplacer {
   // 用于记录ghost_map的状态
 
   /* alive, evictable entries count */
-  [[maybe_unused]] size_t curr_size_{0};
+  size_t curr_size_{0};
   // 可以被驱逐的真实缓存页
   // 其中{0}表示 curr_size_ 的初始化为0
   /* p as in original paper */
-  [[maybe_unused]] size_t mru_target_size_{0};
+  size_t mru_target_size_{0};
   // ARC算法中的参数p，控制MRU和MFU的容量分配倾向
   /* c as in original paper */
-  [[maybe_unused]] size_t replacer_size_;
+  size_t replacer_size_;
   // ARC 算法中的参数c，即缓存容量
   std::mutex latch_;
   //目前所使用的锁
