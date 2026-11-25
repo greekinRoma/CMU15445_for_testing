@@ -16,6 +16,65 @@
 #include "common/config.h"
 #include "common/exception.h"
 #include <algorithm>
+
+// ============================================================================
+//                         ARC Replacer 实现速查
+// ----------------------------------------------------------------------------
+// 【结构】
+//   mru_        : 最近页(只访问过 1 次)   frame_id 链表,前端最老
+//   mfu_        : 高频页(访问过 >= 2 次)  frame_id 链表,后端最老
+//   mru_ghost_  : 从 mru_ 淘汰的页         page_id  链表,前端最老
+//   mfu_ghost_  : 从 mfu_ 淘汰的页         page_id  链表,后端最老
+//   alive_map_  : frame_id -> FrameStatus   (活页索引)
+//   ghost_map_  : page_id  -> FrameStatus   (幽灵索引)
+//   curr_size_  : 可驱逐活页数(只统计 evictable_ == true)
+//   mru_target_size_ (p) : MRU 的目标大小,初始 0,范围 [0, c]
+//
+// 【方向约定】"离 ! 越近越新": [<-mru_ghost-][<-mru-]![-mfu->][->mfu_ghost->]
+//   插入:    mru_.push_back         mfu_.push_front
+//            mru_ghost_.push_back   mfu_ghost_.push_front
+//   取最老:  mru_.front()           mfu_.back()
+//            mru_ghost_.front()     mfu_ghost_.back()
+//
+// 【RecordAccess 四种情况】
+//   1. 命中活页(alive_map_ 按 frame_id 查):
+//        MRU -> 从 mru_ 摘出,插 mfu_ 前端,状态改 MFU
+//        MFU -> 刷新到 mfu_ 前端
+//        return
+//   2. 命中幽灵(ghost_map_ 按 page_id 查):
+//        删除前先取 b1 = |mru_ghost_|, b2 = |mfu_ghost_|
+//        MRU_GHOST: delta = (b1 >= b2) ? 1 : b2/b1;  p = min(p + delta, c)
+//        MFU_GHOST: delta = (b2 >= b1) ? 1 : b1/b2;  p = (p < delta) ? 0 : p - delta
+//        删幽灵(链表 + ghost_map_),复活到 mfu_ 前端,状态 MFU
+//        return
+//   3. 全 miss:
+//        4A: |mru_| + |mru_ghost_| == c 且 |mru_| < c
+//            -> 删 mru_ghost_ 最老(前端) + ghost_map_
+//        否则 4B: 四表合计 >= 2c
+//            -> 删 mfu_ghost_ 最老(后端) + ghost_map_
+//        新页: 状态 MRU, mru_.push_back(尾部)
+//
+// 【Evict 步骤】
+//   curr_size_ == 0 -> return nullopt
+//   选边: mru_.size() >= p ? 先 mru_ : 先 mfu_      (等号归 mru_)
+//   mru_ 正扫(front 起)跳过 pinned;mfu_ 反扫(back 起)跳过 pinned
+//   整侧都不行 -> 换另一侧;两侧都不行 -> return nullopt
+//   取 pid -> alive_map_.erase -> 链表 remove
+//   from mru_: mru_ghost_.push_back(pid) + 状态 MRU_GHOST
+//   from mfu_: mfu_ghost_.push_front(pid) + 状态 MFU_GHOST
+//   curr_size_--; return victim
+//
+// 【计数维护】curr_size_ 只由 SetEvictable(±1)、Evict(-1)、Remove(-1) 修改
+//
+// 【常见坑】
+//   - 幽灵查表用 page_id,活页查表用 frame_id
+//   - 先量尺寸/先读字段,再 erase/remove(迭代器会失效)
+//   - size_t 减法防回绕: (p < delta) ? 0 : p - delta;不要写 max(p - delta, 0)
+//   - 不存在的 frame: Remove 静默返回;SetEvictable/RecordAccess 越界抛异常
+//   - Remove 不产生 ghost;全新页不进 mfu_,也不碰 p 和 curr_size_
+//   - std::list 的 pop_front/pop_back 返回 void,要 front()/back() 先取
+// ============================================================================
+
 namespace bustub {
 
 /**
@@ -45,81 +104,61 @@ ArcReplacer::ArcReplacer(size_t num_frames) : replacer_size_(num_frames) {}
  *
  * @return frame id of the evicted frame, or std::nullopt if cannot evict
  */
-// 在可驱逐的活页中挑选一个受害者，把它的page_id写进对应ghost写进ghost，返回它的frame_id，一个挑选不出来就返回null
 auto ArcReplacer::Evict() -> std::optional<frame_id_t> 
 { 
     std::scoped_lock lock(latch_);
 
-    if (curr_size_ == 0 )
+    if (curr_size_<=0) return std::nullopt;
+    auto find_mru = [&]() -> std::optional<frame_id_t>
     {
-        return std::nullopt;
-    }
-    const bool try_mru_first = mru_.size() >= mru_target_size_;
-
-    auto find_in_mru = [&]() -> std::optional<frame_id_t>
-    {
-        for (frame_id_t frame:mru_)
+        for (auto frame:mru_)
         {
             auto it = alive_map_.find(frame);
-            if (it!=alive_map_.end()&&it->second->evictable_) return frame;  
+            if (!it->second->evictable_) continue;
+            else
+            {
+                mru_.remove(frame);
+                mru_ghost_.push_back(it->second->page_id_);
+                ghost_map_.emplace(it->second->page_id_,std::make_shared<FrameStatus>(it->second->page_id_,it->second->frame_id_,false,ArcStatus::MRU_GHOST));
+                alive_map_.erase(it);
+                curr_size_--;
+                return frame;
+            }
         }
         return std::nullopt;
     };
-
-    auto find_in_mfu = [&]() ->std::optional<frame_id_t>
+    auto find_mfu = [&]() -> std::optional<frame_id_t>
     {
-        for(auto rit=mfu_.rbegin();rit!=mfu_.rend();++rit)
+        for (auto frame=mfu_.rbegin();frame!=mfu_.rend();frame++)
         {
-        auto it = alive_map_.find(*rit);
-        if (it !=alive_map_.end()&& it->second->evictable_)
-        {
-            return *rit;
-        }
+            auto it = alive_map_.find(*frame);
+            if (!it->second->evictable_) continue;
+            else
+            {
+                mfu_.remove(*frame);
+                mfu_ghost_.push_front(it->second->page_id_);
+                ghost_map_.emplace(it->second->page_id_,std::make_shared<FrameStatus>(it->second->page_id_,it->second->frame_id_,false,ArcStatus::MFU_GHOST));
+                alive_map_.erase(it);
+                curr_size_--;
+                return *frame;
+            }
         }
         return std::nullopt;
     };
-
-    std::optional<frame_id_t> victim;
-    bool from_mru = try_mru_first;
-    if (try_mru_first)
+    if (mru_.size()>=mru_target_size_)
     {
-        victim = find_in_mru();
-        if (!victim)
-        {
-            victim =find_in_mfu();
-            from_mru = false;
-        }
+        auto victim = find_mru();
+        if (victim) return victim;
+        return find_mfu();
     }
     else
     {
-        victim = find_in_mfu();
-        if (!victim)
-        {
-            victim = find_in_mru();
-            from_mru = true;
-        }
+        auto victim = find_mfu();
+        if (victim) return victim;
+        return find_mru();
     }
 
-    if (!victim) return std::nullopt;
-
-    auto st =alive_map_.find(*victim);
-    const page_id_t pid = st->second->page_id_;
-    alive_map_.erase(st);
-
-    if (from_mru)
-    {
-        mru_.remove(*victim);
-        mru_ghost_.push_back(pid);
-        ghost_map_.emplace(pid,std::make_shared<FrameStatus>(pid, *victim, false, ArcStatus::MRU_GHOST));
-    }
-    else
-    {
-        mfu_.remove(*victim);
-        mfu_ghost_.push_front(pid);
-        ghost_map_.emplace(pid,std::make_shared<FrameStatus>(pid, *victim, false, ArcStatus::MFU_GHOST));
-    }
-    curr_size_ --;
-    return victim;
+    return std::nullopt;
 }
 
 /**
@@ -154,71 +193,67 @@ auto ArcReplacer::Evict() -> std::optional<frame_id_t>
 void ArcReplacer::RecordAccess(frame_id_t frame_id, page_id_t page_id, [[maybe_unused]] AccessType access_type) 
 {
     std::scoped_lock lock(latch_);
-    if (frame_id >= static_cast<frame_id_t>(replacer_size_)||frame_id<0)
-    {
-        throw Exception("Error in frame id.");
-    }
+    if (frame_id>=replacer_size_||frame_id<0) throw Exception("Error in Record Access!");
     auto it = alive_map_.find(frame_id);
-    if (it != alive_map_.end())
+    // 属于mru
+    // 属于mfu
+    if (it!=alive_map_.end()) 
     {
-        if(it->second->arc_status_== ArcStatus::MFU)
-        {
-            mfu_.remove(frame_id);
-            mfu_.emplace_front(frame_id);
-        }
-        else
+        if (it->second->arc_status_==ArcStatus::MRU)
         {
             mru_.remove(frame_id);
-            mfu_.emplace_front(frame_id);
+            mfu_.push_front(std::move(frame_id));
             it->second->arc_status_ = ArcStatus::MFU;
-        }
-        return;
-    }
-    auto git = ghost_map_.find(page_id);
-    // std::unordered_map<frame_id_t, std::shared_ptr<FrameStatus>>::iterator 是 it的类型
-    if (git!=ghost_map_.end())
-    {
-        const size_t b1 = mru_ghost_.size();
-        const size_t b2 = mfu_ghost_.size();
-        const size_t c = replacer_size_;
-
-        if (git->second->arc_status_==ArcStatus::MRU_GHOST)
-        {
-            mru_ghost_.remove(page_id);
-            const size_t delta = (b1>=b2)? 1:(b2/b1);
-            mru_target_size_ = std::min(mru_target_size_+delta,c);
         }
         else
         {
-            mfu_ghost_.remove(page_id);   
-            const size_t delta = (b2>=b1)? 1:(b1/b2);
-            mru_target_size_ = (mru_target_size_<delta)? 0:mru_target_size_-delta;
+            mfu_.remove(frame_id);
+            mfu_.push_front(std::move(frame_id));
         }
-        ghost_map_.erase(git);
-        mfu_.push_front(frame_id);
-        alive_map_.emplace(frame_id,std::make_shared<FrameStatus>(FrameStatus(page_id, frame_id, false, ArcStatus::MFU)));
         return;
-        // 活页永远不会超，我们只需要管ghost_page
     }
-    // alive_map_.emplace(frame_id,std::make_shared<FrameStatus>(FrameStatus(page_id, frame_id, false, ArcStatus::MRU)));
-    // mru_.push_back(frame_id);
-    // if (mru_.size() + mru_ghost_.size() == replacer_size_)
-    // {
-    //     page_id_t victim_page = mru_ghost_.front();
-    //     mru_ghost_.pop_front();
-    //     ghost_map_.erase(victim_page);
-    // }
-    // else if
-    if (mru_.size()+mru_ghost_.size() == replacer_size_)
+    // 属于mru_ghost
+    // 属于mfu_ghost
+    auto git = ghost_map_.find(page_id);
+    const size_t b1 = mru_ghost_.size();
+    const size_t b2 = mfu_ghost_.size();
+    size_t delta = 1;
+    if (git!=ghost_map_.end())
     {
-        if(mru_.size()<replacer_size_ && !mru_ghost_.empty())
+        if (git->second->arc_status_==ArcStatus::MRU_GHOST)
         {
-            page_id_t victim_page = mru_ghost_.front();
-            mru_ghost_.pop_front();
-            ghost_map_.erase(victim_page);
+            if (b1 != 0&& b1 < b2)
+            {
+                delta = b2 / b1;
+            }
+            mru_target_size_ = std::min(mru_target_size_ + delta,replacer_size_);
+            mru_ghost_.remove(page_id);
+        }
+        else
+        {
+            if (b2!=0&& b2<b1)
+            {
+                delta = b1/b2;
+            }
+            mru_target_size_ = (mru_target_size_ < delta)? 0: (mru_target_size_ - delta);
+            mfu_ghost_.remove(page_id);
+        }
+        mfu_.push_front(frame_id);
+        alive_map_.emplace(frame_id,std::make_shared<FrameStatus>(page_id,frame_id,false,ArcStatus::MFU));
+        ghost_map_.erase(git);
+        return;
+    }
+    // 都不属于
+    if (mru_.size()+mru_ghost_.size()==replacer_size_)
+    {
+        if (mru_.size()<replacer_size_&&!mru_ghost_.empty())
+        {
+           page_id_t victim_page = mru_ghost_.front();
+           mru_ghost_.pop_front();
+           ghost_map_.erase(victim_page);
         }
     }
-    else if (mru_.size() + mfu_.size()+mfu_ghost_.size()+mru_ghost_.size()>=2*replacer_size_)
+    else if (mru_.size()+mru_ghost_.size()+mfu_.size()+mfu_ghost_.size()==2*replacer_size_)
     {
         if (!mfu_ghost_.empty())
         {
@@ -227,51 +262,11 @@ void ArcReplacer::RecordAccess(frame_id_t frame_id, page_id_t page_id, [[maybe_u
             ghost_map_.erase(victim_page);
         }
     }
+
     alive_map_.emplace(frame_id,std::make_shared<FrameStatus>(page_id,frame_id,false,ArcStatus::MRU));
     mru_.push_back(frame_id);
 }
-//知识点
-/**
- * 堆（Heap）与栈（Stack）的内存管理机制：
- *
- * 1. 栈（Stack）
- *    每个线程通常拥有独立的栈空间，由操作系统和线程运行库分配。
- *    栈主要用于存储函数调用信息、局部变量等。
- *    局部对象在作用域结束时自动销毁，栈空间可以被后续函数复用。
- *    线程结束并完成资源回收后，其栈空间被回收。
- *
- * 2. 堆（Heap）
- *    堆属于进程的动态内存空间，可以被同一进程中的多个线程访问。
- *    堆对象的生命周期不直接依赖于创建它的函数或线程。
- *    堆内存的回收方式取决于其分配方式：
- *      - new         : 通过 delete 手动释放；
- *      - malloc      : 通过 free 手动释放；
- *      - make_unique : 由唯一所有者自动管理；
- *      - make_shared : 由共享所有者通过引用计数自动管理。
- *    释放的内存通常先归还给内存分配器，不一定立即归还操作系统。
- *    进程结束时，操作系统会回收该进程占用的内存资源。
- *
- * 3. std::make_shared<FrameStatus>()
- *    在堆上创建 FrameStatus 对象及其控制块，并返回 shared_ptr。
- *    初始共享引用计数为 1，复制智能指针会增加引用计数，
- *    智能指针销毁或 reset() 会减少引用计数。
- *    当共享引用计数归零时，FrameStatus 对象自动销毁。
- *
- * 4. 在 ArcReplacer 中的作用
- *    局部 shared_ptr 通常存储于当前线程的栈中，
- *    而其指向的 FrameStatus 对象存储于堆中。
- *    将 shared_ptr 复制至 alive_map_ 或 ghost_map_ 后，
- *    即使当前函数或线程结束，只要哈希表仍持有该对象，
- *    FrameStatus 就不会被销毁。
- *
- *    注意：shared_ptr 只保证共享所有权的安全管理，
- *    不保证其指向对象的并发读写安全，仍需使用 mutex 等同步机制。
- *
- * 总结：
- *    栈空间的生命周期取决于线程；
- *    栈中局部对象的生命周期取决于作用域；
- *    堆中动态对象的生命周期取决于所有权或显式释放操作。
- */
+
 /**
  * TODO(P1): Add implementation
  *
@@ -292,14 +287,14 @@ void ArcReplacer::RecordAccess(frame_id_t frame_id, page_id_t page_id, [[maybe_u
 void ArcReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable) 
 {
     std::scoped_lock lock(latch_);
-    if (frame_id >= static_cast<frame_id_t>(replacer_size_)||frame_id<0)
-    {
-        throw Exception("Error in frame id.");
-    }
     auto it = alive_map_.find(frame_id);
-    if (it==alive_map_.end()||it->second->evictable_ == set_evictable) return;
-    set_evictable? curr_size_++: curr_size_--;
+    if(frame_id>=replacer_size_||frame_id<0)
+    {
+        throw Exception("Invalid frame ID, please use another frame id.");
+    }
+    if (it==alive_map_.end()||it->second->evictable_==set_evictable) return;
     it->second->evictable_ = set_evictable;
+    set_evictable? curr_size_++:curr_size_--;
 }
 
 /**
@@ -326,17 +321,19 @@ void ArcReplacer::Remove(frame_id_t frame_id)
     if (it==alive_map_.end()) return;
     if (!it->second->evictable_)
     {
-        throw Exception("frame_id Error!");
+        throw Exception("The frame is non-evitable!");
     }
-    if (it->second->arc_status_ == ArcStatus::MRU)
+    if (it->second->arc_status_==ArcStatus::MFU)
     {
-        mru_.remove(frame_id);
+        alive_map_.erase(it);
+        mfu_.remove(frame_id);
     }
     else
     {
-        mfu_.remove(frame_id);
+        alive_map_.erase(it);
+        mru_.remove(frame_id);
     }
-    alive_map_.erase(it);
+
     curr_size_--;
 }
 
@@ -349,7 +346,6 @@ void ArcReplacer::Remove(frame_id_t frame_id)
  */
 auto ArcReplacer::Size() -> size_t 
 { 
-    // return 0; 
     std::scoped_lock lock(latch_);
     return curr_size_;
 }
