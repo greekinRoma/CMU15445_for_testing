@@ -27,6 +27,13 @@ namespace bustub {
  */
 struct DiskRequest {
   /** Flag indicating whether the request is a write or a read. */
+  DiskRequest(bool is_write, char* data, page_id_t page_id, std::promise<bool> callback):
+  is_write_(is_write),
+  data_(data),
+  page_id_(page_id),
+  callback_(std::move(callback)){}
+  // promise 是只可移动的类型
+
   bool is_write_;
   // true = 写， false = 读
   /**

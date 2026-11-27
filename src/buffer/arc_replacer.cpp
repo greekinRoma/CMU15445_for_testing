@@ -84,7 +84,10 @@ namespace bustub {
  * @brief a new ArcReplacer, with lists initialized to be empty and target size to 0
  * @param num_frames the maximum number of frames the ArcReplacer will be required to cache
  */
-ArcReplacer::ArcReplacer(size_t num_frames) : replacer_size_(num_frames) {}
+ArcReplacer::ArcReplacer(size_t num_frames) : replacer_size_(num_frames) 
+{
+    
+}
 
 /**
  * TODO(P1): Add implementation
@@ -104,8 +107,8 @@ ArcReplacer::ArcReplacer(size_t num_frames) : replacer_size_(num_frames) {}
  *
  * @return frame id of the evicted frame, or std::nullopt if cannot evict
  */
-auto ArcReplacer::Evict() -> std::optional<frame_id_t> 
-{ 
+auto ArcReplacer::Evict() -> std::optional<frame_id_t>
+{
     std::scoped_lock lock(latch_);
 
     if (curr_size_<=0) return std::nullopt;
@@ -190,81 +193,71 @@ auto ArcReplacer::Evict() -> std::optional<frame_id_t>
  * @param access_type type of access that was received. This parameter is only needed for
  * leaderboard tests.
  */
-void ArcReplacer::RecordAccess(frame_id_t frame_id, page_id_t page_id, [[maybe_unused]] AccessType access_type) 
+void ArcReplacer::RecordAccess(frame_id_t frame_id, page_id_t page_id, [[maybe_unused]] AccessType access_type)
 {
     std::scoped_lock lock(latch_);
-    if (frame_id>=replacer_size_||frame_id<0) throw Exception("Error in Record Access!");
+
+    if (frame_id>=static_cast<frame_id_t>(replacer_size_)||frame_id<0) throw Exception("Error in frame id, the frame id is illegal.");
+
     auto it = alive_map_.find(frame_id);
-    // 属于mru
-    // 属于mfu
-    if (it!=alive_map_.end()) 
+    if(it!=alive_map_.end())
     {
         if (it->second->arc_status_==ArcStatus::MRU)
         {
             mru_.remove(frame_id);
-            mfu_.push_front(std::move(frame_id));
+            mfu_.push_front(frame_id);
             it->second->arc_status_ = ArcStatus::MFU;
         }
         else
         {
             mfu_.remove(frame_id);
-            mfu_.push_front(std::move(frame_id));
+            mfu_.push_front(frame_id);
         }
         return;
     }
-    // 属于mru_ghost
-    // 属于mfu_ghost
+    
     auto git = ghost_map_.find(page_id);
     const size_t b1 = mru_ghost_.size();
     const size_t b2 = mfu_ghost_.size();
-    size_t delta = 1;
     if (git!=ghost_map_.end())
     {
         if (git->second->arc_status_==ArcStatus::MRU_GHOST)
         {
-            if (b1 != 0&& b1 < b2)
-            {
-                delta = b2 / b1;
-            }
-            mru_target_size_ = std::min(mru_target_size_ + delta,replacer_size_);
             mru_ghost_.remove(page_id);
-        }
+            mfu_.push_front(frame_id);
+            alive_map_.emplace(frame_id,std::make_shared<FrameStatus>(page_id,frame_id,false,ArcStatus::MFU));
+            ghost_map_.erase(git);
+            size_t delta = (b1<b2)? b2/b1:1;
+            mru_target_size_ = (mru_target_size_+delta<replacer_size_)? mru_target_size_ + delta: replacer_size_;
+        }   
         else
         {
-            if (b2!=0&& b2<b1)
-            {
-                delta = b1/b2;
-            }
-            mru_target_size_ = (mru_target_size_ < delta)? 0: (mru_target_size_ - delta);
             mfu_ghost_.remove(page_id);
+            mfu_.push_front(frame_id);
+            alive_map_.emplace(frame_id,std::make_shared<FrameStatus>(page_id,frame_id,false,ArcStatus::MFU));
+            ghost_map_.erase(git);
+            size_t delta = (b2<b1)? b1/b2:1;
+            mru_target_size_ = (mru_target_size_>delta)? mru_target_size_-delta:0;
         }
-        mfu_.push_front(frame_id);
-        alive_map_.emplace(frame_id,std::make_shared<FrameStatus>(page_id,frame_id,false,ArcStatus::MFU));
-        ghost_map_.erase(git);
         return;
     }
-    // 都不属于
-    if (mru_.size()+mru_ghost_.size()==replacer_size_)
+    if (mru_ghost_.size()+mru_.size()>=replacer_size_&&!mru_ghost_.empty())
     {
-        if (mru_.size()<replacer_size_&&!mru_ghost_.empty())
-        {
-           page_id_t victim_page = mru_ghost_.front();
-           mru_ghost_.pop_front();
-           ghost_map_.erase(victim_page);
-        }
-    }
-    else if (mru_.size()+mru_ghost_.size()+mfu_.size()+mfu_ghost_.size()==2*replacer_size_)
-    {
-        if (!mfu_ghost_.empty())
-        {
-            page_id_t victim_page = mfu_ghost_.back();
-            mfu_ghost_.pop_back();
-            ghost_map_.erase(victim_page);
-        }
-    }
 
+        page_id_t page_id = mru_ghost_.front();
+        mru_ghost_.pop_front();
+        ghost_map_.erase(page_id);
+    }
+    else if (mru_ghost_.size()+mfu_.size()+mru_.size()+mfu_ghost_.size()>=2*replacer_size_&&!mfu_ghost_.empty())
+    {
+        /* code */
+        page_id_t page_id = mfu_ghost_.back();
+        mfu_ghost_.pop_back();
+        ghost_map_.erase(page_id);
+    }
     alive_map_.emplace(frame_id,std::make_shared<FrameStatus>(page_id,frame_id,false,ArcStatus::MRU));
     mru_.push_back(frame_id);
+    
 }
 
 /**
@@ -284,11 +277,11 @@ void ArcReplacer::RecordAccess(frame_id_t frame_id, page_id_t page_id, [[maybe_u
  * @param frame_id id of frame whose 'evictable' status will be modified
  * @param set_evictable whether the given frame is evictable or not
  */
-void ArcReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable) 
+void ArcReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable)
 {
     std::scoped_lock lock(latch_);
     auto it = alive_map_.find(frame_id);
-    if(frame_id>=replacer_size_||frame_id<0)
+    if(frame_id>=static_cast<frame_id_t>(replacer_size_)||frame_id<0)
     {
         throw Exception("Invalid frame ID, please use another frame id.");
     }
@@ -313,7 +306,7 @@ void ArcReplacer::SetEvictable(frame_id_t frame_id, bool set_evictable)
  *
  * @param frame_id id of frame to be removed
  */
-void ArcReplacer::Remove(frame_id_t frame_id) 
+void ArcReplacer::Remove(frame_id_t frame_id)
 {
     std::scoped_lock lock(latch_);
 
@@ -344,8 +337,8 @@ void ArcReplacer::Remove(frame_id_t frame_id)
  *
  * @return size_t
  */
-auto ArcReplacer::Size() -> size_t 
-{ 
+auto ArcReplacer::Size() -> size_t
+{
     std::scoped_lock lock(latch_);
     return curr_size_;
 }
